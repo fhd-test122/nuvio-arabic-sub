@@ -8,9 +8,9 @@ app.use(cors());
 
 const manifest = {
     id: "org.fahd.smartarabicsub",
-    version: "1.3.0",
-    name: "مترجم جوجل الذكي (SRT + SDH)",
-    description: "ترجمة فورية للعربية شاملة ملفات SDH والنسخ المدمجة مع مطابقة البصمة",
+    version: "1.4.0",
+    name: "مترجم جوجل الذكي (مطابقة تلقائية للنسخة)",
+    description: "يتعرف على نوع الحلقة (WEB/BluRay/HDTV) ويرتب الترجمة الموزونة تلقائياً",
     resources: [
         {
             name: "subtitles",
@@ -22,7 +22,78 @@ const manifest = {
     catalogs: []
 };
 
-// دالة قراءة وفك ضغط ملفات الترجمة إن كانت مضغوطة
+// تحليل المعاملات المرسلة من Nuvio (البصمة الرقمية واسم ملف الحلقة)
+function parseExtraParams(extraStr) {
+    const params = {};
+    if (!extraStr) return params;
+    const clean = extraStr.replace(/\.json$/, '');
+    clean.split('&').forEach(pair => {
+        const idx = pair.indexOf('=');
+        if (idx !== -1) {
+            const key = pair.slice(0, idx);
+            const val = decodeURIComponent(pair.slice(idx + 1));
+            params[key] = val;
+        }
+    });
+    return params;
+}
+
+// خوارزمية التعرف على نوع الحلقة ومطابقة اسم الملف والبصمة
+function calculateMatchScore(sub, videoFilename, hasVideoHash, sourceName, indexInSource) {
+    let score = 0;
+    let badge = "";
+
+    // OpenSubtitles يضع المطابق للبصمة الرقمية في المرتبة الأولى
+    if (sourceName === "OpenSub" && hasVideoHash && indexInSource === 0) {
+        score += 100;
+        badge = "Hash-Match";
+    }
+
+    const subText = `${sub.id || ''} ${sub.url || ''} ${sub.title || ''} ${sub.release || ''}`.toLowerCase();
+    const vidText = (videoFilename || '').toLowerCase();
+
+    if (vidText) {
+        // 1. مطابقة مصدر الفيديو (WEB / BluRay / HDTV / DVD)
+        const sources = [
+            { tag: "WEB", keys: ["web-dl", "webrip", "web.", ".web"] },
+            { tag: "BluRay", keys: ["bluray", "bdrip", "brrip", "remux"] },
+            { tag: "HDTV", keys: ["hdtv", "pdtv", "dsr"] },
+            { tag: "DVD", keys: ["dvdrip", "dvd"] }
+        ];
+
+        for (const src of sources) {
+            const vidHas = src.keys.some(k => vidText.includes(k));
+            const subHas = src.keys.some(k => subText.includes(k));
+            if (vidHas && subHas) {
+                score += 35;
+                if (!badge) badge = src.tag;
+            }
+        }
+
+        // 2. مطابقة الدقة (1080p / 720p / 2160p)
+        const resolutions = ["2160p", "1080p", "720p", "480p"];
+        for (const res of resolutions) {
+            if (vidText.includes(res) && subText.includes(res)) {
+                score += 15;
+            }
+        }
+
+        // 3. مطابقة اسم فريق الرفع (Release Group) مثل FLUX, NTb, RARBG, PSA, YIFY
+        const cleanVidName = vidText.replace(/\.[a-z0-9]{2,4}$/, ''); // إزالة الامتداد مثل .mkv
+        const groupMatch = cleanVidName.match(/[-.]([a-z0-9]{2,12})$/i);
+        if (groupMatch && groupMatch[1]) {
+            const releaseGroup = groupMatch[1].toLowerCase();
+            const ignoredWords = ["mkv", "mp4", "avi", "x264", "x265", "hevc", "aac", "ac3", "1080p", "720p"];
+            if (!ignoredWords.includes(releaseGroup) && subText.includes(releaseGroup)) {
+                score += 55;
+                badge = `${releaseGroup.toUpperCase()}-Match`;
+            }
+        }
+    }
+
+    return { score, badge };
+}
+
 async function fetchRawSrt(url) {
     const response = await axios.get(url, {
         responseType: 'arraybuffer',
@@ -30,14 +101,12 @@ async function fetchRawSrt(url) {
         headers: { "User-Agent": "Mozilla/5.0" }
     });
     const buffer = Buffer.from(response.data);
-    // فحص ما إذا كان الملف مضغوطاً بصيغة Gzip
     if (buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
         return zlib.gunzipSync(buffer).toString('utf-8');
     }
     return buffer.toString('utf-8');
 }
 
-// دالة الترجمة مع الحفاظ الكامل على نصوص وأقواس SDH
 async function translateSrtToArabic(srtContent) {
     const cleanSrt = srtContent.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const blocks = cleanSrt.split(/\n\n+/);
@@ -48,7 +117,6 @@ async function translateSrtToArabic(srtContent) {
         if (lines.length >= 2) {
             const timeIndex = lines.findIndex(l => l.includes('-->'));
             if (timeIndex !== -1) {
-                // إزالة وسوم الألوان البرمجية فقط مع ترك أقواس SDH كاملة كما هي
                 const textLines = lines.slice(timeIndex + 1).join(' ')
                     .replace(/<\/?[^>]+(>|$)/g, '')
                     .trim();
@@ -99,7 +167,6 @@ app.get('/manifest.json', (req, res) => {
     res.json(manifest);
 });
 
-// سحب الترجمات الإنجليزية وملفات SDH من 3 مصادر معاً لضمان التوفر 100%
 app.get(['/subtitles/:type/:id/:extra.json', '/subtitles/:type/:id.json'], async (req, res) => {
     try {
         const { type, id, extra } = req.params;
@@ -107,11 +174,15 @@ app.get(['/subtitles/:type/:id/:extra.json', '/subtitles/:type/:id.json'], async
         const cleanExtra = extra ? extra.replace(/\.json$/, '') : '';
         const extraPath = cleanExtra ? `/${cleanExtra}` : '';
 
-        // المصادر الثلاثة (تشمل نسخ WEB-DL و BluRay المدمجة وملفات SDH)
+        // قراءة اسم ملف الفيديو وبصمته من Nuvio
+        const extraParams = parseExtraParams(cleanExtra);
+        const videoFilename = extraParams.filename || '';
+        const hasVideoHash = Boolean(extraParams.videoHash);
+
         const sources = [
             { name: "OpenSub", url: `https://opensubtitles-v3.strem.io/subtitles/${type}/${cleanId}${extraPath}.json` },
-            { name: "SubDL-SDH", url: `https://subdl.strem.top/subtitles/${type}/${cleanId}.json` },
-            { name: "OS-Pro", url: `https://opensubtitles.stremio.ru/subtitles/${type}/${cleanId}.json` }
+            { name: "SubDL", url: `https://subdl.strem.top/subtitles/${type}/${cleanId}${extraPath}.json` },
+            { name: "OS-Pro", url: `https://opensubtitles.stremio.ru/subtitles/${type}/${cleanId}${extraPath}.json` }
         ];
 
         const results = await Promise.allSettled(
@@ -121,7 +192,7 @@ app.get(['/subtitles/:type/:id/:extra.json', '/subtitles/:type/:id.json'], async
             })))
         );
 
-        let combinedEngSubs = [];
+        let scoredSubs = [];
         const seenUrls = new Set();
 
         for (const result of results) {
@@ -131,29 +202,44 @@ app.get(['/subtitles/:type/:id/:extra.json', '/subtitles/:type/:id.json'], async
                     return (lang === 'eng' || lang === 'en' || lang.includes('english') || lang.includes('sdh'));
                 });
 
-                for (const sub of engList) {
+                engList.forEach((sub, idx) => {
                     if (sub.url && !seenUrls.has(sub.url)) {
                         seenUrls.add(sub.url);
-                        combinedEngSubs.push({
+                        const { score, badge } = calculateMatchScore(
+                            sub,
+                            videoFilename,
+                            hasVideoHash,
+                            result.value.sourceName,
+                            idx
+                        );
+                        scoredSubs.push({
                             url: sub.url,
-                            source: result.value.sourceName
+                            source: result.value.sourceName,
+                            score,
+                            badge
                         });
                     }
-                }
+                });
             }
         }
 
-        // أخذ أفضل 8 ترجمات شاملة الـ SDH والمطابقة للبصمة
-        const topSubs = combinedEngSubs.slice(0, 8);
+        // ترتيب الترجمات تلقائياً بحيث تكون الأكثر تطابقاً مع الحلقة في الأعلى دائماً
+        scoredSubs.sort((a, b) => b.score - a.score);
 
+        const topSubs = scoredSubs.slice(0, 8);
         const protocol = req.headers['x-forwarded-proto'] || req.protocol;
         const host = `${protocol}://${req.get('host')}`;
 
-        const translatedSubtitles = topSubs.map((sub, index) => ({
-            id: index === 0 ? `Google-AR-Match-1 (${sub.source})` : `Google-AR-${index + 1} (${sub.source})`,
-            url: `${host}/translate.srt?url=${encodeURIComponent(sub.url)}`,
-            lang: "ara"
-        }));
+        const translatedSubtitles = topSubs.map((sub, index) => {
+            const matchLabel = sub.badge ? ` [${sub.badge}]` : '';
+            return {
+                id: index === 0
+                    ? `AR-Best-1 (${sub.source})${matchLabel}`
+                    : `AR-${index + 1} (${sub.source})${matchLabel}`,
+                url: `${host}/translate.srt?url=${encodeURIComponent(sub.url)}`,
+                lang: "ara"
+            };
+        });
 
         res.json({ subtitles: translatedSubtitles });
     } catch (e) {
